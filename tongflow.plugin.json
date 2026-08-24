@@ -1,0 +1,25 @@
+{
+    "plugin": {
+        "name": "Qwen-Image-Edit",
+        "description": "Instruction-based image editing and multi-image fusion with Qwen-Image-Edit-2511 (Alibaba Qwen).",
+        "icon": "/plugins/tongflow-modal-qwen-image-edit.svg"
+    },
+    "env": [
+        {
+            "key": "MODAL_TOKEN_ID",
+            "required": true,
+            "description": "Modal token id",
+            "url": "https://modal.com/settings/tokens"
+        },
+        {
+            "key": "MODAL_TOKEN_SECRET",
+            "required": true,
+            "description": "Modal token secret (paired with MODAL_TOKEN_ID)"
+        },
+        {
+            "key": "TONGFLOW_MODAL_CALL_TIMEOUT_S",
+            "default": "2400",
+            "description": "Max seconds to wait for a Modal call"
+        }
+    ]
+}
