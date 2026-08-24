@@ -20,7 +20,10 @@ import modal
 
 _cfg: dict[str, Any] = {}
 _hf = _cfg.get("hf") if isinstance(_cfg.get("hf"), dict) else {}
-REPO_ID = str(_hf.get("repoId") or "Qwen/Qwen-Image-Edit-2511")
+REPO_ID = str(
+    _hf.get("repoId")
+    or "lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder"
+)
 REVISION = str(_hf.get("revision") or "")
 MODEL_DIR = f"/models/{REPO_ID}"
 
@@ -37,7 +40,7 @@ model_downloader = modal.App("model_downloader")
         "huggingface_hub==1.6.0",
     ),
     volumes={"/models": volume},
-    # 57.7GB across ten shards; the default hour is not enough on a cold volume.
+    # 18GB, but a cold volume and a slow mirror still outrun the default hour.
     timeout=7200,
 )
 def _download() -> None:

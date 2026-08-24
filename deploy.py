@@ -25,18 +25,22 @@ from tongflow.slots import node_slot
 
 _cfg: dict[str, Any] = {}
 _hf = _cfg.get("hf") if isinstance(_cfg.get("hf"), dict) else {}
-# 2511 over 2509: same size and same pipeline, better subject consistency and
-# less drift between the input and the edit. Ungated, unlike the FLUX.2 line.
-REPO_ID = str(_hf.get("repoId") or "Qwen/Qwen-Image-Edit-2511")
+# A Diffusers-native repack of Qwen-Image-Edit-2509: SVDQuant int4 transformer
+# for the `nunchaku_lite` loader, a 4-bit NF4 text encoder, and the Lightning
+# 4-step LoRA already fused. 18GB against the official 57.7GB, and 21GB of VRAM
+# against a card's worth. 2509 rather than 2511 because no 2511 checkpoint is
+# packaged for this loader — every one on the Hub is a ComfyUI single file.
+REPO_ID = str(
+    _hf.get("repoId")
+    or "lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder"
+)
 MODEL_DIR = f"/models/{REPO_ID}"
 
-# Sampling defaults from the model card — plugin-internal, not ABI fields.
-DEFAULT_NUM_INFERENCE_STEPS = 40
-DEFAULT_TRUE_CFG_SCALE = 4.0
-DEFAULT_GUIDANCE_SCALE = 1.0
-# The card passes a single space rather than "": the pipeline builds a negative
-# branch either way, and an empty string trips its prompt-length check.
-DEFAULT_NEGATIVE_PROMPT = " "
+# Sampling defaults — plugin-internal, not ABI fields. The Lightning distillation
+# is fused into these weights, so four steps is the design point, and CFG is
+# switched off (true_cfg_scale 1.0): a distilled model has it baked out already.
+DEFAULT_NUM_INFERENCE_STEPS = 4
+DEFAULT_TRUE_CFG_SCALE = 1.0
 
 volume_name = str(_cfg.get("volumeName") or "models")
 volume = modal.Volume.from_name(volume_name, create_if_missing=True)
@@ -59,6 +63,11 @@ image = (
         "accelerate==1.13.0",
         "huggingface_hub==1.6.0",
         "sentencepiece==0.2.1",
+        # The `nunchaku_lite` quantizer fetches its CUDA kernels through the
+        # Hub at load time rather than a version-pinned wheel; bitsandbytes is
+        # what the 4-bit NF4 text encoder loads under.
+        "kernels==0.16.1",
+        "bitsandbytes==0.50.1",
     )
 )
 
@@ -67,15 +76,15 @@ with image.imports():
     from diffusers import QwenImageEditPlusPipeline
 
 
-# 80GB, not L40S: the transformer is 40.9GB in bf16 and the Qwen2.5-VL text
-# encoder another 16.6GB, so the weights alone overflow a 48GB card. Offloading
-# would swap most of that over PCIe on every call — slower per image, and Modal
-# bills by the second either way.
+# L40S, and not by preference: the Diffusers Nunchaku quantizer refuses to load
+# on Hopper outright (`device_capability[0] == 9`), so an H100 is not an option
+# here. It wants Turing or newer for int4, and Ada satisfies that. The published
+# benchmark peaks at 21GiB, so 48GB is roomy.
 @deploy
 @app.cls(
     scaledown_window=2,
     image=image,
-    gpu="H100",
+    gpu="L40S",
     volumes={"/models": volume},
     timeout=1800,
 )
@@ -101,9 +110,7 @@ class Inference:
         kwargs: dict[str, Any] = {
             "image": images,
             "prompt": prompt,
-            "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
             "true_cfg_scale": DEFAULT_TRUE_CFG_SCALE,
-            "guidance_scale": DEFAULT_GUIDANCE_SCALE,
             "num_inference_steps": DEFAULT_NUM_INFERENCE_STEPS,
             "num_images_per_prompt": 1,
         }

@@ -1,6 +1,6 @@
 # tongflow-modal-qwen-image-edit
 
-[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) as a TongFlow plugin, served from your own [Modal](https://modal.com) account.
+Qwen-Image-Edit as a TongFlow plugin, served from your own [Modal](https://modal.com) account.
 
 ## Node slots
 
@@ -14,14 +14,28 @@ list — the two slots differ only in how many images the node hands it.
 
 ## Weights
 
-`Qwen/Qwen-Image-Edit-2511` — **57.7 GB** (a 40.9 GB transformer plus a 16.6 GB
-Qwen2.5-VL text encoder), pulled once into the shared `models` Modal Volume:
+[`lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder`](https://huggingface.co/lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder)
+— **18 GB**, pulled once into the shared `models` Modal Volume:
 
 ```bash
 modal run download.py::download
 ```
 
-The repo is **not gated**, so no Hugging Face token is involved.
+Ungated, so no Hugging Face token is involved.
+
+It is a Diffusers-native repack of `Qwen/Qwen-Image-Edit-2509` with three things
+already done to it:
+
+| | |
+| --- | --- |
+| Transformer | SVDQuant **int4** (rank 32), for the `nunchaku_lite` loader — 11.6 GB, from 40.9 GB |
+| Text encoder | BitsAndBytes **4-bit NF4** — 6.2 GB, from 16.6 GB |
+| Steps | Lightning **4-step** LoRA fused in — from 40 |
+
+**2509 rather than 2511** only because no 2511 checkpoint is packaged for this
+loader: every nunchaku 2511 repo on the Hub is a ComfyUI single file, which
+Diffusers cannot read (it has no handling for the `weight_scale` companion
+tensors those carry).
 
 ## Deploy
 
@@ -29,13 +43,16 @@ The repo is **not gated**, so no Hugging Face token is involved.
 modal deploy deploy.py
 ```
 
-Runs on an **H100**: the weights alone overflow a 48 GB card, and offloading
-them would swap most of that over PCIe on every call.
+Runs on an **L40S**, and not by preference — the Diffusers Nunchaku quantizer
+refuses Hopper outright, so an H100 is not available to this checkpoint. It
+wants Turing or newer for int4, which Ada satisfies. The upstream benchmark
+peaks at 21 GiB, so 48 GB is roomy.
 
 ## Defaults
 
-Sampling follows the model card — 40 steps, `true_cfg_scale` 4.0,
-`guidance_scale` 1.0. They are plugin-internal constants, not ABI fields.
+Four steps with `true_cfg_scale` 1.0: the distillation is fused into the
+weights, and a distilled model has classifier-free guidance baked out already.
+Plugin-internal constants, not ABI fields.
 
 An edit keeps the input image's size unless the node turns off "match input
 size"; fusion uses the node's width/height when set, and the pipeline's own
