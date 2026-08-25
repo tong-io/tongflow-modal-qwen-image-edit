@@ -1,41 +1,48 @@
 # tongflow-modal-qwen-image-edit
 
-Qwen-Image-Edit as a TongFlow plugin, served from your own [Modal](https://modal.com) account.
+[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) as a TongFlow plugin, run through a headless [ComfyUI](https://github.com/comfyanonymous/ComfyUI) on your own [Modal](https://modal.com) account.
 
 ## Node slots
 
 | Slot | Node | What it does |
 | --- | --- | --- |
 | `image-edit` | Image → Image | Edit one image from a written instruction. |
-| `image-fusion` | Images → Image | Combine two or more images into one scene. |
+| `image-fusion` | Images → Image | Combine **two or three** images into one scene. |
 
-Both run on the same `QwenImageEditPlusPipeline`, whose `image` argument takes a
-list — the two slots differ only in how many images the node hands it.
+Three is a hard ceiling: `TextEncodeQwenImageEditPlus` exposes `image1`,
+`image2`, `image3` and nothing further. A fourth reference is refused rather
+than quietly dropped.
+
+## Why ComfyUI and not Diffusers
+
+The quantised weights are ComfyUI's own format — fp8 tensors paired with
+`weight_scale` companions — and Diffusers has no loader for them. Reading them
+through ComfyUI keeps fp8 resident instead of dequantising to bf16, which is
+the whole difference between this and a 57.7 GB model on an 80 GB card:
+
+| | Diffusers, unquantised | Here |
+| --- | ---: | ---: |
+| Download | 57.7 GB | **31 GB** |
+| GPU | H100 | **L40S** |
+| Steps | 40 | **8** |
 
 ## Weights
 
-[`lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder`](https://huggingface.co/lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder)
-— **18 GB**, pulled once into the shared `models` Modal Volume:
+Comfy-Org's own repacks — the files the official 2511 template names — plus
+LightX2V's distillation LoRA:
+
+| File | Size | Into |
+| --- | ---: | --- |
+| `qwen_image_edit_2511_fp8mixed.safetensors` | 20.53 GB | `diffusion_models/` |
+| `qwen_2.5_vl_7b_fp8_scaled.safetensors` | 9.38 GB | `text_encoders/` |
+| `qwen_image_vae.safetensors` | 0.25 GB | `vae/` |
+| `Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors` | 0.85 GB | `loras/` |
 
 ```bash
 modal run download.py::download
 ```
 
-Ungated, so no Hugging Face token is involved.
-
-It is a Diffusers-native repack of `Qwen/Qwen-Image-Edit-2509` with three things
-already done to it:
-
-| | |
-| --- | --- |
-| Transformer | SVDQuant **int4** (rank 32), for the `nunchaku_lite` loader — 11.6 GB, from 40.9 GB |
-| Text encoder | BitsAndBytes **4-bit NF4** — 6.2 GB, from 16.6 GB |
-| Steps | Lightning **4-step** LoRA fused in — from 40 |
-
-**2509 rather than 2511** only because no 2511 checkpoint is packaged for this
-loader: every nunchaku 2511 repo on the Hub is a ComfyUI single file, which
-Diffusers cannot read (it has no handling for the `weight_scale` companion
-tensors those carry).
+All ungated, so no Hugging Face token is involved.
 
 ## Deploy
 
@@ -43,17 +50,26 @@ tensors those carry).
 modal deploy deploy.py
 ```
 
-Runs on an **L40S**, and not by preference — the Diffusers Nunchaku quantizer
-refuses Hopper outright, so an H100 is not available to this checkpoint. It
-wants Turing or newer for int4, which Ada satisfies. The upstream benchmark
-peaks at 21 GiB, so 48 GB is roomy.
+ComfyUI is pinned to `v0.33.4` and the server boots once per container, so
+weights stay warm across calls.
 
-## Defaults
+## The graph
 
-Four steps with `true_cfg_scale` 1.0: the distillation is fused into the
-weights, and a distilled model has classifier-free guidance baked out already.
-Plugin-internal constants, not ABI fields.
+Mirrors the official `image_qwen_image_edit_2511` template:
 
-An edit keeps the input image's size unless the node turns off "match input
-size"; fusion uses the node's width/height when set, and the pipeline's own
-derivation otherwise.
+```
+UNETLoader → ModelSamplingAuraFlow(3.1) → CFGNorm → LoraLoaderModelOnly → KSampler
+LoadImage → FluxKontextImageScale → TextEncodeQwenImageEditPlus.image1..3
+                                  → VAEEncode → KSampler.latent_image
+KSampler(euler, simple, 8 steps, cfg 1.0) → VAEDecode → SaveImage
+```
+
+Two things differ from the template. Its
+`FluxKontextMultiReferenceLatentMethod` pair is dropped — the template's own
+note says they are unnecessary with Comfy-Org files, which is what this
+downloads. And the lightning branch is taken unconditionally rather than
+through a switch: 8 steps at `cfg` 1.0, because a distilled model has
+classifier-free guidance baked out already.
+
+`QIE_STEPS`, `QIE_CFG`, `QIE_SHIFT` and `QIE_LORA_STRENGTH` override the
+sampling constants without a code change.

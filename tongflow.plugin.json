@@ -1,7 +1,7 @@
 {
     "plugin": {
         "name": "Qwen-Image-Edit",
-        "description": "Instruction-based image editing and multi-image fusion with Qwen-Image-Edit-2509 (SVDQuant int4, 4-step Lightning).",
+        "description": "Instruction-based image editing and multi-image fusion with Qwen-Image-Edit-2511 (headless ComfyUI, fp8 + 8-step Lightning).",
         "icon": "/plugins/tongflow-modal-qwen-image-edit.svg"
     },
     "env": [

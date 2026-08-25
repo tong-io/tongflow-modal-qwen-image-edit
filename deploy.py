@@ -1,7 +1,17 @@
-"""Modal deploy entry for Qwen-Image-Edit.
+"""Modal deploy entry for Qwen-Image-Edit (headless ComfyUI).
 
 Deploy:
   modal deploy deploy.py
+
+ComfyUI rather than Diffusers because the quantised weights are ComfyUI's own
+format: fp8 tensors paired with `weight_scale` companions, which Diffusers has
+no loader for. Reading them through ComfyUI keeps fp8 resident instead of
+dequantising to bf16, which is what turns a 57.7GB / 80GB-card model into a
+31GB / L40S one.
+
+The graph mirrors the official `image_qwen_image_edit_2511` template, minus its
+FluxKontextMultiReferenceLatentMethod pair — the template's own note says those
+are unnecessary with Comfy-Org files, which is what this plugin downloads.
 
 Design constraints:
   - Keep this file mostly self-contained because Modal remote imports may mount
@@ -10,9 +20,9 @@ Design constraints:
 
 from __future__ import annotations
 
-import io
+import os
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import modal
 from tongflow import deploy
@@ -23,116 +33,254 @@ from tongflow.protocol import asset, prompt_media_to_bytes
 from tongflow.slots import node_slot
 
 
-_cfg: dict[str, Any] = {}
-_hf = _cfg.get("hf") if isinstance(_cfg.get("hf"), dict) else {}
-# A Diffusers-native repack of Qwen-Image-Edit-2509: SVDQuant int4 transformer
-# for the `nunchaku_lite` loader, a 4-bit NF4 text encoder, and the Lightning
-# 4-step LoRA already fused. 18GB against the official 57.7GB, and 21GB of VRAM
-# against a card's worth. 2509 rather than 2511 because no 2511 checkpoint is
-# packaged for this loader — every one on the Hub is a ComfyUI single file.
-REPO_ID = str(
-    _hf.get("repoId")
-    or "lite-infer/qwen-image-edit-2509-lightning-4steps-nunchaku-lite-int4_r32-bnb4-text-encoder"
-)
-MODEL_DIR = f"/models/{REPO_ID}"
+COMFY = "/opt/ComfyUI"
+COMFY_TAG = "v0.33.4"
+COMFY_MODELS = "/models/comfyui"
+COMFY_LOG = "/tmp/comfy.log"
 
-# Sampling defaults — plugin-internal, not ABI fields. The Lightning distillation
-# is fused into these weights, so four steps is the design point, and CFG is
-# switched off (true_cfg_scale 1.0): a distilled model has it baked out already.
-DEFAULT_NUM_INFERENCE_STEPS = 4
-DEFAULT_TRUE_CFG_SCALE = 1.0
+# Comfy-Org's own repacks, the files the official 2511 template names.
+UNET = "qwen_image_edit_2511_fp8mixed.safetensors"
+TEXT_ENCODER = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+VAE = "qwen_image_vae.safetensors"
+# LightX2V distillation, fused at sampling time by LoraLoaderModelOnly. Eight
+# steps rather than four: the same LoRA family, one notch back from the fastest
+# setting, which is where the quality argument is easiest to win.
+LORA = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
+STEPS = int(os.environ.get("QIE_STEPS") or 8)
+# A distilled model has classifier-free guidance baked out; the template's
+# lightning branch drives cfg to 1.0 and the base branch to 4.0.
+CFG = float(os.environ.get("QIE_CFG") or 1.0)
+SHIFT = float(os.environ.get("QIE_SHIFT") or 3.1)
+LORA_STRENGTH = float(os.environ.get("QIE_LORA_STRENGTH") or 1.0)
 
-volume_name = str(_cfg.get("volumeName") or "models")
-volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+# TextEncodeQwenImageEditPlus exposes image1/image2/image3 and nothing beyond.
+MAX_IMAGES = 3
 
-
-# ── app ──────────────────────────────────────────────────────────────────────
+volume = modal.Volume.from_name("models", create_if_missing=True)
 
 APP_NAME = Path(__file__).resolve().parent.name
 app = modal.App(APP_NAME)
 
 image = (
-    modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime")
-    .pip_install(
-        "tongflow==0.2.21",
-        "fastapi[standard]",
-        "diffusers==0.40.0",
-        "transformers==5.4.0",
-        "safetensors==0.7.0",
-        "pillow==12.1.1",
-        "accelerate==1.13.0",
-        "huggingface_hub==1.6.0",
-        "sentencepiece==0.2.1",
-        # The `nunchaku_lite` quantizer fetches its CUDA kernels through the
-        # Hub at load time rather than a version-pinned wheel; bitsandbytes is
-        # what the 4-bit NF4 text encoder loads under.
-        "kernels==0.16.1",
-        "bitsandbytes==0.50.1",
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12"
     )
+    .apt_install("git")
+    .pip_install(
+        "torch==2.7.1",
+        "torchvision==0.22.1",
+        "torchaudio==2.7.1",
+        extra_index_url="https://download.pytorch.org/whl/cu128",
+    )
+    .run_commands(
+        f"git clone --depth 1 --branch {COMFY_TAG} "
+        f"https://github.com/comfyanonymous/ComfyUI.git {COMFY}",
+        f"pip install -r {COMFY}/requirements.txt",
+    )
+    .pip_install("tongflow==0.2.21", "fastapi[standard]")
+    .env({"PYTHONPATH": COMFY, "HF_HOME": "/models/hf"})
 )
 
 with image.imports():
-    import torch
-    from diffusers import QwenImageEditPlusPipeline
+    import io
+    import json
+    import random
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
 
 
-# L40S, and not by preference: the Diffusers Nunchaku quantizer refuses to load
-# on Hopper outright (`device_capability[0] == 9`), so an H100 is not an option
-# here. It wants Turing or newer for int4, and Ada satisfies that. The published
-# benchmark peaks at 21GiB, so 48GB is roomy.
+def _tail_log(n: int = 3000) -> str:
+    """Tail of the ComfyUI server stdout — the per-node execution trace, which
+    is where a failure actually explains itself."""
+    try:
+        with open(COMFY_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return "(no server log)"
+
+
+def _graph(prompt: str, images: List[str], seed: int) -> dict:
+    """API-format graph, wired as the official 2511 template wires it."""
+    g: dict[str, Any] = {
+        "1": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": UNET, "weight_dtype": "default"}},
+        "2": {"class_type": "ModelSamplingAuraFlow",
+              "inputs": {"model": ["1", 0], "shift": SHIFT}},
+        "3": {"class_type": "CFGNorm",
+              "inputs": {"model": ["2", 0], "strength": 1.0}},
+        "4": {"class_type": "LoraLoaderModelOnly",
+              "inputs": {"model": ["3", 0], "lora_name": LORA,
+                         "strength_model": LORA_STRENGTH}},
+        "5": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": TEXT_ENCODER, "type": "qwen_image",
+                         "device": "default"}},
+        "6": {"class_type": "VAELoader", "inputs": {"vae_name": VAE}},
+    }
+
+    # One LoadImage + FluxKontextImageScale per reference; the first doubles as
+    # the latent the sampler denoises, which is what makes this an edit rather
+    # than a generation.
+    scaled: list[list] = []
+    for i, name in enumerate(images):
+        load, scale = f"10{i}", f"11{i}"
+        g[load] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        g[scale] = {"class_type": "FluxKontextImageScale",
+                    "inputs": {"image": [load, 0]}}
+        scaled.append([scale, 0])
+
+    def encode(text: str) -> dict:
+        inputs: dict[str, Any] = {"clip": ["5", 0], "prompt": text, "vae": ["6", 0]}
+        for i, ref in enumerate(scaled):
+            inputs[f"image{i + 1}"] = ref
+        return {"class_type": "TextEncodeQwenImageEditPlus", "inputs": inputs}
+
+    g["7"] = encode(prompt)
+    g["8"] = encode("")
+    g["9"] = {"class_type": "VAEEncode",
+              "inputs": {"pixels": scaled[0], "vae": ["6", 0]}}
+    g["12"] = {"class_type": "KSampler",
+               "inputs": {"model": ["4", 0], "positive": ["7", 0],
+                          "negative": ["8", 0], "latent_image": ["9", 0],
+                          "seed": seed, "steps": STEPS, "cfg": CFG,
+                          "sampler_name": "euler", "scheduler": "simple",
+                          "denoise": 1.0}}
+    g["13"] = {"class_type": "VAEDecode",
+               "inputs": {"samples": ["12", 0], "vae": ["6", 0]}}
+    g["14"] = {"class_type": "SaveImage",
+               "inputs": {"images": ["13", 0], "filename_prefix": "qie"}}
+    return g
+
+
+def _submit(base: str, wf: dict) -> tuple[bool, Any]:
+    """Queue a graph, poll to completion, return (True, png) or (False, error)."""
+    t0 = time.monotonic()
+    body = json.dumps({"prompt": wf}).encode()
+    req = urllib.request.Request(
+        f"{base}/prompt", data=body, headers={"Content-Type": "application/json"}
+    )
+    try:
+        pid = json.loads(urllib.request.urlopen(req, timeout=30).read())["prompt_id"]
+    except urllib.error.HTTPError as e:
+        return False, f"workflow rejected: {e.read().decode()[:1500]}"
+
+    out, status = None, {}
+    for _ in range(1800):
+        time.sleep(1)
+        with urllib.request.urlopen(f"{base}/history/{pid}", timeout=10) as r:
+            hist = json.loads(r.read())
+        if pid not in hist:
+            continue
+        h = hist[pid]
+        status = h.get("status", {})
+        if status.get("status_str") == "error":
+            return False, ("comfy error: "
+                           + json.dumps(status.get("messages", status))[:1500]
+                           + "\n[server log]\n" + _tail_log())
+        if h.get("outputs") and status.get("completed"):
+            out = h["outputs"]
+            break
+    if not out:
+        return False, "timed out\n[server log]\n" + _tail_log()
+
+    print(f"[qie] graph done in {time.monotonic() - t0:.0f}s", flush=True)
+    for node_out in out.values():
+        for item in node_out.get("images", []):
+            fn, sub = item.get("filename"), item.get("subfolder", "")
+            d = {"output": "output", "temp": "temp"}.get(item.get("type"), "output")
+            path = os.path.join(COMFY, d, sub, fn or "")
+            if fn and os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                if raw:
+                    return True, raw
+    return False, ("no image output; outputs=" + json.dumps(out)[:600]
+                   + "\n[server log]\n" + _tail_log())
+
+
+# L40S: fp8 weights stay fp8 under ComfyUI, so the resident set is roughly the
+# 20.5GB transformer plus a 9.4GB text encoder it swaps out before sampling.
 @deploy
 @app.cls(
-    scaledown_window=2,
     image=image,
     gpu="L40S",
     volumes={"/models": volume},
     timeout=1800,
+    scaledown_window=2,
 )
 class Inference:
     @modal.enter()
-    def load(self):
-        self.pipe = QwenImageEditPlusPipeline.from_pretrained(
-            MODEL_DIR,
-            torch_dtype=torch.bfloat16,
-        ).to("cuda")
-        self.pipe.set_progress_bar_config(disable=True)
+    def _boot(self) -> None:
+        """Boot the ComfyUI server once; reused across calls (models stay warm)."""
+        t0 = time.monotonic()
+        os.makedirs(COMFY_MODELS, exist_ok=True)
+        with open(os.path.join(COMFY, "extra_model_paths.yaml"), "w") as f:
+            f.write(
+                "qie_volume:\n"
+                f"  base_path: {COMFY_MODELS}/\n"
+                "  diffusion_models: diffusion_models\n"
+                "  text_encoders: text_encoders\n"
+                "  vae: vae\n"
+                "  loras: loras\n"
+            )
+        for sub, name in (("diffusion_models", UNET), ("text_encoders", TEXT_ENCODER),
+                          ("vae", VAE), ("loras", LORA)):
+            if not os.path.isfile(os.path.join(COMFY_MODELS, sub, name)):
+                raise RuntimeError(
+                    f"{sub}/{name} missing from the models volume — run "
+                    "`modal run download.py::download` first"
+                )
 
-    def _png_bytes(
-        self,
-        prompt: str,
-        images: List[Any],
-        seed: int | None = None,
-        width: int | None = None,
-        height: int | None = None,
-    ) -> bytes:
-        # height/width left as None makes the pipeline follow the input image,
-        # which is what an edit should do unless the node asks otherwise.
-        kwargs: dict[str, Any] = {
-            "image": images,
-            "prompt": prompt,
-            "true_cfg_scale": DEFAULT_TRUE_CFG_SCALE,
-            "num_inference_steps": DEFAULT_NUM_INFERENCE_STEPS,
-            "num_images_per_prompt": 1,
-        }
-        if width is not None:
-            kwargs["width"] = width
-        if height is not None:
-            kwargs["height"] = height
-        if seed is not None:
-            kwargs["generator"] = torch.Generator(device="cuda").manual_seed(int(seed))
+        self._logfh = open(COMFY_LOG, "wb")
+        self.proc = subprocess.Popen(
+            ["python", "main.py", "--listen", "127.0.0.1", "--port", "8188",
+             "--disable-auto-launch"],
+            cwd=COMFY, stdout=self._logfh, stderr=subprocess.STDOUT,
+        )
+        self.base = "http://127.0.0.1:8188"
+        info = None
+        for _ in range(600):
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"ComfyUI exited early: {self.proc.returncode}")
+            try:
+                with urllib.request.urlopen(f"{self.base}/object_info", timeout=2) as r:
+                    if r.status == 200:
+                        info = json.loads(r.read())
+                        break
+            except Exception:
+                time.sleep(1)
+        if info is None:
+            raise RuntimeError("ComfyUI server did not become ready")
+        for cls in ("TextEncodeQwenImageEditPlus", "FluxKontextImageScale", "CFGNorm"):
+            if cls not in info:
+                raise RuntimeError(f"{cls} missing from ComfyUI {COMFY_TAG} — bump COMFY_TAG")
+        print(f"[qie] comfy {COMFY_TAG} ready in {time.monotonic() - t0:.0f}s "
+              f"(steps={STEPS} cfg={CFG:g} shift={SHIFT:g}) — weights load lazily",
+              flush=True)
 
-        with torch.inference_mode():
-            result = self.pipe(**kwargs)
+    @modal.exit()
+    def _shutdown(self) -> None:
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
 
-        buf = io.BytesIO()
-        result.images[0].save(buf, format="PNG")
-        return buf.getvalue()
+    def _stage(self, blobs: List[bytes]) -> List[str]:
+        os.makedirs(f"{COMFY}/input", exist_ok=True)
+        names = []
+        for i, raw in enumerate(blobs):
+            name = f"qie_{os.getpid()}_{time.time_ns()}_{i}.png"
+            with open(f"{COMFY}/input/{name}", "wb") as f:
+                f.write(raw)
+            names.append(name)
+        return names
 
-    @staticmethod
-    def _to_pil(raw: bytes) -> Any:
-        from PIL import Image
-
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+    def _run(self, text: str, blobs: List[bytes], seed: Optional[int]) -> tuple[bool, Any]:
+        s = int(seed) if seed is not None else random.randrange(2**31)
+        return _submit(self.base, _graph(text, self._stage(blobs), s))
 
     @modal.method()
     @node_slot(NodeSlots.IMAGE_EDIT)
@@ -142,18 +290,10 @@ class Inference:
         text = (input.text or "").strip()
         if not text:
             return ImageEditOutput(success=False, error="Missing edit instruction")
-
-        # match_input_size is the product's way of saying "don't resize me";
-        # honouring it means passing no explicit size at all.
-        keep_size = input.match_input_size if input.match_input_size is not None else True
-        raw = self._png_bytes(
-            text,
-            [self._to_pil(prompt_media_to_bytes(input.image))],
-            seed=input.seed,
-            width=None if keep_size else input.width,
-            height=None if keep_size else input.height,
-        )
-        return ImageEditOutput(success=True, image=asset(raw, mime="image/png"))
+        ok, res = self._run(text, [prompt_media_to_bytes(input.image)], input.seed)
+        if not ok:
+            return ImageEditOutput(success=False, error=str(res))
+        return ImageEditOutput(success=True, image=asset(res, mime="image/png"))
 
     @modal.method()
     @node_slot(NodeSlots.IMAGE_FUSION)
@@ -161,24 +301,20 @@ class Inference:
         imgs = input.images or []
         if len(imgs) < 2:
             return ImageFusionOutput(success=False, error="Need at least 2 images")
+        # Refusing beats quietly dropping references the user wired up.
+        if len(imgs) > MAX_IMAGES:
+            return ImageFusionOutput(
+                success=False,
+                error=f"This model takes at most {MAX_IMAGES} images; got {len(imgs)}",
+            )
         text = (input.text or "").strip()
         if not text:
             return ImageFusionOutput(success=False, error="Missing fusion instruction")
+        ok, res = self._run(text, [prompt_media_to_bytes(x) for x in imgs], input.seed)
+        if not ok:
+            return ImageFusionOutput(success=False, error=str(res))
+        return ImageFusionOutput(success=True, image=asset(res, mime="image/png"))
 
-        raw = self._png_bytes(
-            text,
-            [self._to_pil(prompt_media_to_bytes(x)) for x in imgs],
-            seed=input.seed,
-            width=input.width,
-            height=input.height,
-        )
-        return ImageFusionOutput(success=True, image=asset(raw, mime="image/png"))
-
-    # Cloud single-node self-serve: ONE container, direct browser stream. The
-    # browser's EventSource is 302'd here with taskId/token/origin; serve_stream
-    # _from_spec (SDK) fetches the run spec from the Worker, runs the slot
-    # in-container, and streams progress + result. Streaming dodges the 150s
-    # cap. Label is uniform (`<app>-serve`) so the Worker derives the URL.
     @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-serve")
     def serve(self, taskId: str = "", token: str = "", origin: str = ""):
         from fastapi.responses import StreamingResponse
@@ -186,15 +322,10 @@ class Inference:
 
         return StreamingResponse(
             serve_stream_from_spec(
-                origin,
-                taskId,
-                token,
-                __file__,
+                origin, taskId, token, __file__,
                 invoke=lambda m, inp: getattr(self, m).local(inp),
             ),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*",
-            },
+            headers={"Cache-Control": "no-cache",
+                     "Access-Control-Allow-Origin": "*"},
         )
