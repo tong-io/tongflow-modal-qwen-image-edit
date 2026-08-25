@@ -103,8 +103,16 @@ def _tail_log(n: int = 3000) -> str:
         return "(no server log)"
 
 
-def _graph(prompt: str, images: List[str], seed: int) -> dict:
-    """API-format graph, wired as the official 2511 template wires it."""
+def _graph(prompt: str, images: List[str], seed: int,
+           width: Optional[int] = None, height: Optional[int] = None) -> dict:
+    """API-format graph, wired as the official 2511 template wires it.
+
+    `width`/`height` decide the output size, and they decide it through the
+    latent's shape: with denoise at 1.0 the sampler replaces the latent's
+    contents entirely, so the template's VAEEncode is really just a way of
+    saying "same size as the input". Asking for a size swaps in the empty
+    latent the official text-to-image template uses.
+    """
     g: dict[str, Any] = {
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": UNET, "weight_dtype": "default"}},
@@ -140,8 +148,13 @@ def _graph(prompt: str, images: List[str], seed: int) -> dict:
 
     g["7"] = encode(prompt)
     g["8"] = encode("")
-    g["9"] = {"class_type": "VAEEncode",
-              "inputs": {"pixels": scaled[0], "vae": ["6", 0]}}
+    if width and height:
+        g["9"] = {"class_type": "EmptySD3LatentImage",
+                  "inputs": {"width": int(width), "height": int(height),
+                             "batch_size": 1}}
+    else:
+        g["9"] = {"class_type": "VAEEncode",
+                  "inputs": {"pixels": scaled[0], "vae": ["6", 0]}}
     g["12"] = {"class_type": "KSampler",
                "inputs": {"model": ["4", 0], "positive": ["7", 0],
                           "negative": ["8", 0], "latent_image": ["9", 0],
@@ -278,9 +291,13 @@ class Inference:
             names.append(name)
         return names
 
-    def _run(self, text: str, blobs: List[bytes], seed: Optional[int]) -> tuple[bool, Any]:
+    def _run(self, text: str, blobs: List[bytes], seed: Optional[int],
+             width: Optional[int] = None,
+             height: Optional[int] = None) -> tuple[bool, Any]:
         s = int(seed) if seed is not None else random.randrange(2**31)
-        return _submit(self.base, _graph(text, self._stage(blobs), s))
+        return _submit(
+            self.base, _graph(text, self._stage(blobs), s, width, height)
+        )
 
     @modal.method()
     @node_slot(NodeSlots.IMAGE_EDIT)
@@ -290,7 +307,16 @@ class Inference:
         text = (input.text or "").strip()
         if not text:
             return ImageEditOutput(success=False, error="Missing edit instruction")
-        ok, res = self._run(text, [prompt_media_to_bytes(input.image)], input.seed)
+        # match_input_size is the product's way of saying "don't resize me",
+        # and it is the default: an edit that silently reframes is a bad edit.
+        keep = input.match_input_size if input.match_input_size is not None else True
+        ok, res = self._run(
+            text,
+            [prompt_media_to_bytes(input.image)],
+            input.seed,
+            None if keep else input.width,
+            None if keep else input.height,
+        )
         if not ok:
             return ImageEditOutput(success=False, error=str(res))
         return ImageEditOutput(success=True, image=asset(res, mime="image/png"))
@@ -310,7 +336,13 @@ class Inference:
         text = (input.text or "").strip()
         if not text:
             return ImageFusionOutput(success=False, error="Missing fusion instruction")
-        ok, res = self._run(text, [prompt_media_to_bytes(x) for x in imgs], input.seed)
+        ok, res = self._run(
+            text,
+            [prompt_media_to_bytes(x) for x in imgs],
+            input.seed,
+            input.width,
+            input.height,
+        )
         if not ok:
             return ImageFusionOutput(success=False, error=str(res))
         return ImageFusionOutput(success=True, image=asset(res, mime="image/png"))

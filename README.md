@@ -64,6 +64,12 @@ LoadImage → FluxKontextImageScale → TextEncodeQwenImageEditPlus.image1..3
 KSampler(euler, simple, 8 steps, cfg 1.0) → VAEDecode → SaveImage
 ```
 
+Asking for a width and height swaps the `VAEEncode` for the
+`EmptySD3LatentImage` the official text-to-image template uses. That is the
+only lever on output size: with `denoise` at 1.0 the sampler replaces the
+latent's contents outright, so the template's `VAEEncode` is really just a way
+of saying "same size as the input".
+
 Two things differ from the template. Its
 `FluxKontextMultiReferenceLatentMethod` pair is dropped — the template's own
 note says they are unnecessary with Comfy-Org files, which is what this
