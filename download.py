@@ -10,12 +10,15 @@ import other local modules (e.g. `impl.py`, `config.py`).
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import modal
 
 
 COMFY_MODELS = "/models/comfyui"
+# Same filesystem as COMFY_MODELS, so the move into place is a rename.
+STAGING = "/models/.hf-staging"
 
 # (repo, file in repo, subdirectory ComfyUI looks in). Comfy-Org's repacks are
 # what the official 2511 template names; the LoRA is LightX2V's distillation.
@@ -58,6 +61,7 @@ model_downloader = modal.App("model_downloader")
 def _download() -> None:
     from huggingface_hub import hf_hub_download
 
+    os.makedirs(STAGING, exist_ok=True)
     for repo, path, sub in FILES:
         dest_dir = os.path.join(COMFY_MODELS, sub)
         dest = os.path.join(dest_dir, os.path.basename(path))
@@ -68,10 +72,13 @@ def _download() -> None:
         print(f"Downloading {repo}/{path} -> {dest}")
         # ComfyUI reads a flat directory per kind, so the repo's own nesting is
         # dropped: fetch into a scratch tree, then move the file into place.
-        got = hf_hub_download(repo_id=repo, filename=path, local_dir="/tmp/hf")
+        # The scratch tree lives on the volume, not /tmp — os.replace cannot
+        # cross a device, and /tmp is container-local while /models is mounted.
+        got = hf_hub_download(repo_id=repo, filename=path, local_dir=STAGING)
         os.replace(got, dest)
         print(f"Done: {dest}")
 
+    shutil.rmtree(STAGING, ignore_errors=True)
     volume.commit()
 
 
