@@ -90,7 +90,14 @@ image = (
         f"pip install -r {COMFY}/requirements.txt",
     )
     .pip_install("tongflow==0.2.21", "fastapi[standard]")
-    .env({"PYTHONPATH": COMFY, "HF_HOME": "/models/hf"})
+    .env({
+        "PYTHONPATH": COMFY,
+        "HF_HOME": "/models/hf",
+        # The failing run peaked at 24.9GiB of active memory while holding
+        # 44.9GiB reserved — twenty of it lost to fragmentation, which is the
+        # exact pattern expandable segments exist for.
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    })
 )
 
 with image.imports():
