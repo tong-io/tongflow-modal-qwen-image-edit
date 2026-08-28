@@ -23,7 +23,7 @@ the whole difference between this and a 57.7 GB model on an 80 GB card:
 | | Diffusers, unquantised | Here |
 | --- | ---: | ---: |
 | Download | 57.7 GB | **31 GB** |
-| GPU | H100 | **L40S** |
+| GPU | H100 | H100 |
 | Steps | 40 | **8** |
 
 ## Weights

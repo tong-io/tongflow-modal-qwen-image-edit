@@ -53,6 +53,18 @@ CFG = float(os.environ.get("QIE_CFG") or 1.0)
 SHIFT = float(os.environ.get("QIE_SHIFT") or 3.1)
 LORA_STRENGTH = float(os.environ.get("QIE_LORA_STRENGTH") or 1.0)
 
+# An L40S ran the whole graph and then died allocating inside KSampler. The
+# weights are not the problem — ComfyUI honours this checkpoint's own
+# `comfy_quant` markers and keeps the transformer at its stored 20.5GB — but
+# 48GB does not also cover a 9.4GB text encoder and this model's activations
+# over two references. 80GB does. Nothing forces the choice: the Hopper ban
+# that shaped the earlier plan belonged to Diffusers' Nunchaku loader, which
+# this no longer goes through.
+GPU = (os.environ.get("QIE_GPU") or "H100").strip()
+# Spare flags for the ComfyUI server, e.g. `--lowvram` to trade speed for a
+# smaller card. Left empty: ComfyUI's own memory management is the default.
+COMFY_ARGS = [a for a in (os.environ.get("QIE_COMFY_ARGS") or "").split() if a]
+
 # TextEncodeQwenImageEditPlus exposes image1/image2/image3 and nothing beyond.
 MAX_IMAGES = 3
 
@@ -214,12 +226,10 @@ def _submit(base: str, wf: dict) -> tuple[bool, Any]:
                    + "\n[server log]\n" + _tail_log())
 
 
-# L40S: fp8 weights stay fp8 under ComfyUI, so the resident set is roughly the
-# 20.5GB transformer plus a 9.4GB text encoder it swaps out before sampling.
 @deploy
 @app.cls(
     image=image,
-    gpu="L40S",
+    gpu=GPU,
     volumes={"/models": volume},
     timeout=1800,
     scaledown_window=2,
@@ -250,7 +260,7 @@ class Inference:
         self._logfh = open(COMFY_LOG, "wb")
         self.proc = subprocess.Popen(
             ["python", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-             "--disable-auto-launch"],
+             "--disable-auto-launch", *COMFY_ARGS],
             cwd=COMFY, stdout=self._logfh, stderr=subprocess.STDOUT,
         )
         self.base = "http://127.0.0.1:8188"
@@ -271,8 +281,9 @@ class Inference:
             if cls not in info:
                 raise RuntimeError(f"{cls} missing from ComfyUI {COMFY_TAG} — bump COMFY_TAG")
         print(f"[qie] comfy {COMFY_TAG} ready in {time.monotonic() - t0:.0f}s "
-              f"(steps={STEPS} cfg={CFG:g} shift={SHIFT:g}) — weights load lazily",
-              flush=True)
+              f"(gpu={GPU} steps={STEPS} cfg={CFG:g} shift={SHIFT:g}"
+              + (f" args={' '.join(COMFY_ARGS)}" if COMFY_ARGS else "")
+              + ") — weights load lazily", flush=True)
 
     @modal.exit()
     def _shutdown(self) -> None:
