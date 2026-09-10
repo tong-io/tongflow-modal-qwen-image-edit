@@ -30,7 +30,40 @@ from tongflow.models.image_edit import ImageEditInput, ImageEditOutput
 from tongflow.models.image_fusion import ImageFusionInput, ImageFusionOutput
 from tongflow.node_slots import NodeSlots
 from tongflow.protocol import asset, prompt_media_to_bytes
-from tongflow.slots import node_slot
+from tongflow.slots import current_params, node_slot
+
+
+def _adv(name: str, default):
+    """Advanced-section override (``TONGFLOW_SLOT_PARAMS``) or the plugin default."""
+    v = current_params().get(name)
+    if v is None:
+        return default
+    if isinstance(default, bool):
+        return bool(v)
+    if isinstance(default, int):
+        return int(v)
+    if isinstance(default, float):
+        return float(v)
+    return v
+
+# Per-run knobs offered under the node's collapsed "Advanced" section.
+# Pure literal (the platform scanner reads it by AST, never imports this
+# module). Values reach the handlers via current_params(); an untouched
+# control is absent there and falls back to the plugin default.
+TONGFLOW_SLOT_PARAMS = {
+    "image-edit": {
+        "steps": {"type": "integer", "default": 8, "min": 1, "max": 50, "label": "Steps"},
+        "cfg": {"type": "number", "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "CFG scale"},
+        "shift": {"type": "number", "default": 3.1, "min": 1.0, "max": 10.0, "step": 0.1, "label": "Shift"},
+        "lora_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.5, "step": 0.05, "label": "Lightning LoRA strength"},
+    },
+    "image-fusion": {
+        "steps": {"type": "integer", "default": 8, "min": 1, "max": 50, "label": "Steps"},
+        "cfg": {"type": "number", "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "CFG scale"},
+        "shift": {"type": "number", "default": 3.1, "min": 1.0, "max": 10.0, "step": 0.1, "label": "Shift"},
+        "lora_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.5, "step": 0.05, "label": "Lightning LoRA strength"},
+    },
+}
 
 
 COMFY = "/opt/ComfyUI"
@@ -89,7 +122,7 @@ image = (
         f"https://github.com/comfyanonymous/ComfyUI.git {COMFY}",
         f"pip install -r {COMFY}/requirements.txt",
     )
-    .pip_install("tongflow==0.2.21", "fastapi[standard]")
+    .pip_install("tongflow==0.3.3", "fastapi[standard]")
     .env({
         "PYTHONPATH": COMFY,
         "HF_HOME": "/models/hf",
@@ -136,12 +169,12 @@ def _graph(prompt: str, images: List[str], seed: int,
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": UNET, "weight_dtype": "default"}},
         "2": {"class_type": "ModelSamplingAuraFlow",
-              "inputs": {"model": ["1", 0], "shift": SHIFT}},
+              "inputs": {"model": ["1", 0], "shift": _adv("shift", SHIFT)}},
         "3": {"class_type": "CFGNorm",
               "inputs": {"model": ["2", 0], "strength": 1.0}},
         "4": {"class_type": "LoraLoaderModelOnly",
               "inputs": {"model": ["3", 0], "lora_name": LORA,
-                         "strength_model": LORA_STRENGTH}},
+                         "strength_model": _adv("lora_strength", LORA_STRENGTH)}},
         "5": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": TEXT_ENCODER, "type": "qwen_image",
                          "device": "default"}},
@@ -177,7 +210,7 @@ def _graph(prompt: str, images: List[str], seed: int,
     g["12"] = {"class_type": "KSampler",
                "inputs": {"model": ["4", 0], "positive": ["7", 0],
                           "negative": ["8", 0], "latent_image": ["9", 0],
-                          "seed": seed, "steps": STEPS, "cfg": CFG,
+                          "seed": seed, "steps": _adv("steps", STEPS), "cfg": _adv("cfg", CFG),
                           "sampler_name": "euler", "scheduler": "simple",
                           "denoise": 1.0}}
     g["13"] = {"class_type": "VAEDecode",
