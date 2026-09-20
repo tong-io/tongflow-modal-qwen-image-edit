@@ -1,17 +1,17 @@
-"""Modal deploy entry for Qwen-Image-Edit (headless ComfyUI).
+"""Modal deploy entry for Qwen-Image 2.1 (headless ComfyUI).
 
 Deploy:
   modal deploy deploy.py
 
-ComfyUI rather than Diffusers because the quantised weights are ComfyUI's own
-format: fp8 tensors paired with `weight_scale` companions, which Diffusers has
-no loader for. Reading them through ComfyUI keeps fp8 resident instead of
-dequantising to bf16, which is what turns a 57.7GB / 80GB-card model into a
-31GB / L40S one.
+Qwen-Image-2.1 is one model for four nodes: text-to-image, instruction edit,
+multi-image fusion (references are the same input path as an edit, just more of
+them) and background removal, which the model answers with a genuinely
+transparent PNG because the 2.1 VAE is RGBA.
 
-The graph mirrors the official `image_qwen_image_edit_2511` template, minus its
-FluxKontextMultiReferenceLatentMethod pair — the template's own note says those
-are unnecessary with Comfy-Org files, which is what this plugin downloads.
+ComfyUI rather than Diffusers on two counts: the quantised weights are
+ComfyUI's own int8 `convrot` format, which Diffusers has no loader for, and
+`QwenImage21Pipeline` is still unreleased on Diffusers' main branch, so the
+Diffusers route would pin a moving commit.
 
 Design constraints:
   - Keep this file mostly self-contained because Modal remote imports may mount
@@ -28,6 +28,8 @@ import modal
 from tongflow import deploy
 from tongflow.models.image_edit import ImageEditInput, ImageEditOutput
 from tongflow.models.image_fusion import ImageFusionInput, ImageFusionOutput
+from tongflow.models.image_gen import ImageGenInput, ImageGenOutput
+from tongflow.models.image_matting import ImageMattingInput, ImageMattingOutput
 from tongflow.node_slots import NodeSlots
 from tongflow.protocol import asset, prompt_media_to_bytes
 from tongflow.slots import current_params, node_slot
@@ -46,60 +48,92 @@ def _adv(name: str, default):
         return float(v)
     return v
 
+
 # Per-run knobs offered under the node's collapsed "Advanced" section.
 # Pure literal (the platform scanner reads it by AST, never imports this
 # module). Values reach the handlers via current_params(); an untouched
 # control is absent there and falls back to the plugin default.
+#
+# `resolution` is the reference-image budget, not the output size: references
+# are resized to about resolution x resolution pixels, aspect preserved, and 0
+# means "leave each reference at its own size". An edit wants 0, so the result
+# comes back framed exactly like the input; a fusion normalises instead,
+# because ten full-size references are ten times the sequence to attend over.
 TONGFLOW_SLOT_PARAMS = {
-    "image-edit": {
-        "steps": {"type": "integer", "default": 8, "min": 1, "max": 50, "label": "Steps"},
+    "image-gen": {
+        "steps": {"type": "integer", "default": 25, "min": 1, "max": 60, "label": "Steps"},
         "cfg": {"type": "number", "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "CFG scale"},
-        "shift": {"type": "number", "default": 3.1, "min": 1.0, "max": 10.0, "step": 0.1, "label": "Shift"},
-        "lora_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.5, "step": 0.05, "label": "Lightning LoRA strength"},
+        "transparent": {"type": "boolean", "default": False, "label": "Transparent background (RGBA)"},
+    },
+    "image-edit": {
+        "steps": {"type": "integer", "default": 25, "min": 1, "max": 60, "label": "Steps"},
+        "cfg": {"type": "number", "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "CFG scale"},
+        "resolution": {"type": "integer", "default": 0, "min": 0, "max": 2048, "step": 32, "label": "Reference resolution (0 = keep)"},
     },
     "image-fusion": {
-        "steps": {"type": "integer", "default": 8, "min": 1, "max": 50, "label": "Steps"},
+        "steps": {"type": "integer", "default": 25, "min": 1, "max": 60, "label": "Steps"},
         "cfg": {"type": "number", "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.5, "label": "CFG scale"},
-        "shift": {"type": "number", "default": 3.1, "min": 1.0, "max": 10.0, "step": 0.1, "label": "Shift"},
-        "lora_strength": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.5, "step": 0.05, "label": "Lightning LoRA strength"},
+        "resolution": {"type": "integer", "default": 1024, "min": 0, "max": 2048, "step": 32, "label": "Reference resolution (0 = keep)"},
+    },
+    "image-matting": {
+        "steps": {"type": "integer", "default": 25, "min": 1, "max": 60, "label": "Steps"},
     },
 }
 
 
 COMFY = "/opt/ComfyUI"
-COMFY_TAG = "v0.33.4"
+# TextEncodeQwenImage21 / QwenImage21Cache land in v0.37.0; v0.36.0 has neither.
+COMFY_TAG = "v0.37.0"
 COMFY_MODELS = "/models/comfyui"
 COMFY_LOG = "/tmp/comfy.log"
 
-# Comfy-Org's own repacks, the files the official 2511 template names.
-UNET = "qwen_image_edit_2511_fp8mixed.safetensors"
-TEXT_ENCODER = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
-VAE = "qwen_image_vae.safetensors"
-# LightX2V distillation, fused at sampling time by LoraLoaderModelOnly. Eight
-# steps rather than four: the same LoRA family, one notch back from the fastest
-# setting, which is where the quality argument is easiest to win.
-LORA = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
-STEPS = int(os.environ.get("QIE_STEPS") or 8)
-# A distilled model has classifier-free guidance baked out; the template's
-# lightning branch drives cfg to 1.0 and the base branch to 4.0.
-CFG = float(os.environ.get("QIE_CFG") or 1.0)
-SHIFT = float(os.environ.get("QIE_SHIFT") or 3.1)
-LORA_STRENGTH = float(os.environ.get("QIE_LORA_STRENGTH") or 1.0)
+# Comfy-Org's own repacks, the files the official 2.1 templates name. The int8
+# `convrot` variants are the templates' default and cut the resident weights
+# from 32GB to 17GB at the quality the rotation-aware quantisation was tuned
+# for; the bf16 pair is there if a comparison is ever wanted.
+UNET = "qwen_image_2.1_int8_convrot.safetensors"
+TEXT_ENCODER = "qwen3vl_8b_int8_convrot.safetensors"
+VAE = "qwen_image_2.1_vae_bf16.safetensors"
 
-# An L40S ran the whole graph and then died allocating inside KSampler. The
-# weights are not the problem — ComfyUI honours this checkpoint's own
-# `comfy_quant` markers and keeps the transformer at its stored 20.5GB — but
-# 48GB does not also cover a 9.4GB text encoder and this model's activations
-# over two references. 80GB does. Nothing forces the choice: the Hopper ban
-# that shaped the earlier plan belonged to Diffusers' Nunchaku loader, which
-# this no longer goes through.
+# 2.1 has guidance distilled in, so cfg stays at 1.0 and there is no Lightning
+# LoRA to fuse — 25 steps in a single pass is the official template's setting,
+# and it is already cheaper than 2511's eight steps with CFG.
+STEPS = int(os.environ.get("QIE_STEPS") or 25)
+CFG = float(os.environ.get("QIE_CFG") or 1.0)
+# Reference budget when a slot does not override it (see TONGFLOW_SLOT_PARAMS).
+RESOLUTION = int(os.environ.get("QIE_RESOLUTION") or 1024)
+# Output size for a text-to-image run that names none. One megapixel, as the
+# official template ships; the model goes to 2048x2048 natively if asked.
+DEFAULT_SIZE = int(os.environ.get("QIE_DEFAULT_SIZE") or 1024)
+
+# Prefix KV cache: `auto` spends spare VRAM first and falls back to RAM, which
+# is what makes a re-edit of the same references cheap.
+CACHE_DEVICE = (os.environ.get("QIE_CACHE_DEVICE") or "auto").strip()
+CACHE_DTYPE = (os.environ.get("QIE_CACHE_DTYPE") or "default").strip()
+
+# 17GB of weights plus 2K activations over as many as ten references. An L40S
+# (48GB) is a plausible fit now that the int8 pair replaced 2511's 30GB of fp8
+# — QIE_GPU is there to try it — but 80GB is what this is known to run on, and
+# the failure mode of guessing low is an OOM inside KSampler after the whole
+# graph has already been paid for.
 GPU = (os.environ.get("QIE_GPU") or "H100").strip()
 # Spare flags for the ComfyUI server, e.g. `--lowvram` to trade speed for a
 # smaller card. Left empty: ComfyUI's own memory management is the default.
 COMFY_ARGS = [a for a in (os.environ.get("QIE_COMFY_ARGS") or "").split() if a]
 
-# TextEncodeQwenImageEditPlus exposes image1/image2/image3 and nothing beyond.
-MAX_IMAGES = 3
+# The model card promises up to ten references; the node exposes sixteen
+# slots. Ten is the number we are willing to stand behind.
+MAX_IMAGES = 10
+
+# The official background-removal template's instruction, verbatim. The PNG it
+# asks for is the point: the 2.1 VAE decodes four channels, so the alpha the
+# model paints survives all the way to the file.
+MATTING_PROMPT = "Remove the background, and output a PNG image"
+
+# Transparent text-to-image is a prompt convention rather than a flag; this is
+# the phrasing the model card documents.
+RGBA_PREFIX = "This is an RGBA image with transparency. "
+RGBA_SUFFIX = " The image has alpha channel and the background is transparent."
 
 volume = modal.Volume.from_name("models", create_if_missing=True)
 
@@ -126,7 +160,7 @@ image = (
     .env({
         "PYTHONPATH": COMFY,
         "HF_HOME": "/models/hf",
-        # The failing run peaked at 24.9GiB of active memory while holding
+        # A 2511 run once peaked at 24.9GiB of active memory while holding
         # 44.9GiB reserved — twenty of it lost to fragmentation, which is the
         # exact pattern expandable segments exist for.
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -134,7 +168,6 @@ image = (
 )
 
 with image.imports():
-    import io
     import json
     import random
     import subprocess
@@ -155,68 +188,68 @@ def _tail_log(n: int = 3000) -> str:
         return "(no server log)"
 
 
-def _graph(prompt: str, images: List[str], seed: int,
-           width: Optional[int] = None, height: Optional[int] = None) -> dict:
-    """API-format graph, wired as the official 2511 template wires it.
+def _graph(prompt: str, images: List[str], seed: int, steps: int, cfg: float,
+           resolution: int, width: Optional[int] = None,
+           height: Optional[int] = None) -> dict:
+    """API-format graph, wired as the official 2.1 templates wire it.
 
-    `width`/`height` decide the output size, and they decide it through the
-    latent's shape: with denoise at 1.0 the sampler replaces the latent's
-    contents entirely, so the template's VAEEncode is really just a way of
-    saying "same size as the input". Asking for a size swaps in the empty
-    latent the official text-to-image template uses.
+    One graph covers all four slots: no references and an explicit size is
+    text-to-image, references with no size is an edit that keeps the input's
+    framing, and everything else is the same run with the latent swapped.
+
+    TextEncodeQwenImage21 does the work the 2511 graph needed extra nodes for.
+    It resizes each reference itself, encodes them through the VAE as
+    `reference_latents`, and hands back an empty latent shaped to the first
+    reference — which is why an edit that should not reframe simply uses that
+    third output instead of an EmptyLatentImage.
     """
     g: dict[str, Any] = {
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": UNET, "weight_dtype": "default"}},
-        "2": {"class_type": "ModelSamplingAuraFlow",
-              "inputs": {"model": ["1", 0], "shift": _adv("shift", SHIFT)}},
-        "3": {"class_type": "CFGNorm",
-              "inputs": {"model": ["2", 0], "strength": 1.0}},
-        "4": {"class_type": "LoraLoaderModelOnly",
-              "inputs": {"model": ["3", 0], "lora_name": LORA,
-                         "strength_model": _adv("lora_strength", LORA_STRENGTH)}},
+        "2": {"class_type": "QwenImage21Cache",
+              "inputs": {"model": ["1", 0], "device": CACHE_DEVICE,
+                         "dtype": CACHE_DTYPE}},
         "5": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": TEXT_ENCODER, "type": "qwen_image",
                          "device": "default"}},
         "6": {"class_type": "VAELoader", "inputs": {"vae_name": VAE}},
     }
 
-    # One LoadImage + FluxKontextImageScale per reference; the first doubles as
-    # the latent the sampler denoises, which is what makes this an edit rather
-    # than a generation.
-    scaled: list[list] = []
+    encode: dict[str, Any] = {
+        "clip": ["5", 0],
+        "vae": ["6", 0],
+        "prompt": prompt,
+        "negative_prompt": "",
+        "resolution": int(resolution),
+    }
+    # Autogrow inputs are addressed by their finalized dotted ids — the same
+    # `images.image_N` names the node's schema expands to.
     for i, name in enumerate(images):
-        load, scale = f"10{i}", f"11{i}"
-        g[load] = {"class_type": "LoadImage", "inputs": {"image": name}}
-        g[scale] = {"class_type": "FluxKontextImageScale",
-                    "inputs": {"image": [load, 0]}}
-        scaled.append([scale, 0])
+        node_id = f"10{i}"
+        g[node_id] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        encode[f"images.image_{i + 1}"] = [node_id, 0]
+    g["7"] = {"class_type": "TextEncodeQwenImage21", "inputs": encode}
 
-    def encode(text: str) -> dict:
-        inputs: dict[str, Any] = {"clip": ["5", 0], "prompt": text, "vae": ["6", 0]}
-        for i, ref in enumerate(scaled):
-            inputs[f"image{i + 1}"] = ref
-        return {"class_type": "TextEncodeQwenImageEditPlus", "inputs": inputs}
-
-    g["7"] = encode(prompt)
-    g["8"] = encode("")
     if width and height:
-        g["9"] = {"class_type": "EmptySD3LatentImage",
+        g["9"] = {"class_type": "EmptyLatentImage",
                   "inputs": {"width": int(width), "height": int(height),
                              "batch_size": 1}}
+        latent: list = ["9", 0]
     else:
-        g["9"] = {"class_type": "VAEEncode",
-                  "inputs": {"pixels": scaled[0], "vae": ["6", 0]}}
+        latent = ["7", 2]
+
     g["12"] = {"class_type": "KSampler",
-               "inputs": {"model": ["4", 0], "positive": ["7", 0],
-                          "negative": ["8", 0], "latent_image": ["9", 0],
-                          "seed": seed, "steps": _adv("steps", STEPS), "cfg": _adv("cfg", CFG),
+               "inputs": {"model": ["2", 0], "positive": ["7", 0],
+                          "negative": ["7", 1], "latent_image": latent,
+                          "seed": seed, "steps": steps, "cfg": cfg,
                           "sampler_name": "euler", "scheduler": "simple",
                           "denoise": 1.0}}
     g["13"] = {"class_type": "VAEDecode",
                "inputs": {"samples": ["12", 0], "vae": ["6", 0]}}
+    # SaveImage writes whatever channels it is handed, so a four-channel decode
+    # lands as an RGBA PNG without a separate alpha path.
     g["14"] = {"class_type": "SaveImage",
-               "inputs": {"images": ["13", 0], "filename_prefix": "qie"}}
+               "inputs": {"images": ["13", 0], "filename_prefix": "qi21"}}
     return g
 
 
@@ -251,7 +284,7 @@ def _submit(base: str, wf: dict) -> tuple[bool, Any]:
     if not out:
         return False, "timed out\n[server log]\n" + _tail_log()
 
-    print(f"[qie] graph done in {time.monotonic() - t0:.0f}s", flush=True)
+    print(f"[qi21] graph done in {time.monotonic() - t0:.0f}s", flush=True)
     for node_out in out.values():
         for item in node_out.get("images", []):
             fn, sub = item.get("filename"), item.get("subfolder", "")
@@ -287,10 +320,9 @@ class Inference:
                 "  diffusion_models: diffusion_models\n"
                 "  text_encoders: text_encoders\n"
                 "  vae: vae\n"
-                "  loras: loras\n"
             )
         for sub, name in (("diffusion_models", UNET), ("text_encoders", TEXT_ENCODER),
-                          ("vae", VAE), ("loras", LORA)):
+                          ("vae", VAE)):
             if not os.path.isfile(os.path.join(COMFY_MODELS, sub, name)):
                 raise RuntimeError(
                     f"{sub}/{name} missing from the models volume — run "
@@ -317,11 +349,11 @@ class Inference:
                 time.sleep(1)
         if info is None:
             raise RuntimeError("ComfyUI server did not become ready")
-        for cls in ("TextEncodeQwenImageEditPlus", "FluxKontextImageScale", "CFGNorm"):
+        for cls in ("TextEncodeQwenImage21", "QwenImage21Cache"):
             if cls not in info:
                 raise RuntimeError(f"{cls} missing from ComfyUI {COMFY_TAG} — bump COMFY_TAG")
-        print(f"[qie] comfy {COMFY_TAG} ready in {time.monotonic() - t0:.0f}s "
-              f"(gpu={GPU} steps={STEPS} cfg={CFG:g} shift={SHIFT:g}"
+        print(f"[qi21] comfy {COMFY_TAG} ready in {time.monotonic() - t0:.0f}s "
+              f"(gpu={GPU} steps={STEPS} cfg={CFG:g} cache={CACHE_DEVICE}/{CACHE_DTYPE}"
               + (f" args={' '.join(COMFY_ARGS)}" if COMFY_ARGS else "")
               + ") — weights load lazily", flush=True)
 
@@ -343,12 +375,31 @@ class Inference:
         return names
 
     def _run(self, text: str, blobs: List[bytes], seed: Optional[int],
-             width: Optional[int] = None,
+             resolution: int, width: Optional[int] = None,
              height: Optional[int] = None) -> tuple[bool, Any]:
         s = int(seed) if seed is not None else random.randrange(2**31)
         return _submit(
-            self.base, _graph(text, self._stage(blobs), s, width, height)
+            self.base,
+            _graph(text, self._stage(blobs), s, _adv("steps", STEPS),
+                   _adv("cfg", CFG), resolution, width, height),
         )
+
+    @modal.method()
+    @node_slot(NodeSlots.IMAGE_GEN)
+    def image_gen(self, input: ImageGenInput) -> ImageGenOutput:
+        text = (input.text or "").strip()
+        if not text:
+            return ImageGenOutput(success=False, error="Missing prompt")
+        if _adv("transparent", False):
+            text = RGBA_PREFIX + text + RGBA_SUFFIX
+        ok, res = self._run(
+            text, [], input.seed, RESOLUTION,
+            input.width or DEFAULT_SIZE,
+            input.height or DEFAULT_SIZE,
+        )
+        if not ok:
+            return ImageGenOutput(success=False, error=str(res))
+        return ImageGenOutput(success=True, image=asset(res, mime="image/png"))
 
     @modal.method()
     @node_slot(NodeSlots.IMAGE_EDIT)
@@ -365,6 +416,7 @@ class Inference:
             text,
             [prompt_media_to_bytes(input.image)],
             input.seed,
+            _adv("resolution", 0),
             None if keep else input.width,
             None if keep else input.height,
         )
@@ -391,12 +443,27 @@ class Inference:
             text,
             [prompt_media_to_bytes(x) for x in imgs],
             input.seed,
+            _adv("resolution", RESOLUTION),
             input.width,
             input.height,
         )
         if not ok:
             return ImageFusionOutput(success=False, error=str(res))
         return ImageFusionOutput(success=True, image=asset(res, mime="image/png"))
+
+    @modal.method()
+    @node_slot(NodeSlots.IMAGE_MATTING)
+    def image_matting(self, input: ImageMattingInput) -> ImageMattingOutput:
+        if input.image is None:
+            return ImageMattingOutput(success=False, error="Missing image")
+        # Reference kept at its own size and the latent taken from it, so the
+        # cut-out lines up pixel for pixel with what went in.
+        ok, res = self._run(
+            MATTING_PROMPT, [prompt_media_to_bytes(input.image)], None, 0
+        )
+        if not ok:
+            return ImageMattingOutput(success=False, error=str(res))
+        return ImageMattingOutput(success=True, image=asset(res, mime="image/png"))
 
     @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-serve")
     def serve(self, taskId: str = "", token: str = "", origin: str = ""):

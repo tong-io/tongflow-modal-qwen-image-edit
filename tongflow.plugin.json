@@ -1,7 +1,7 @@
 {
     "plugin": {
-        "name": "Qwen-Image-Edit",
-        "description": "Instruction-based image editing and multi-image fusion with Qwen-Image-Edit-2511 (headless ComfyUI, fp8 + 8-step Lightning).",
+        "name": "Qwen-Image 2.1",
+        "description": "Text-to-image, instruction editing, multi-image fusion (up to 10 references) and transparent background removal with Qwen-Image-2.1 (headless ComfyUI, int8 convrot).",
         "icon": "/plugins/tongflow-modal-qwen-image-edit.svg"
     },
     "env": [

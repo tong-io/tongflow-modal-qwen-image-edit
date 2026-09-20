@@ -1,4 +1,4 @@
-"""Modal download entry for qwen-image-edit (ComfyUI layout).
+"""Modal download entry for Qwen-Image 2.1 (ComfyUI layout).
 
 Run:
   modal run download.py::download
@@ -21,41 +21,49 @@ COMFY_MODELS = "/models/comfyui"
 STAGING = "/models/.hf-staging"
 
 # (repo, file in repo, subdirectory ComfyUI looks in). Comfy-Org's repacks are
-# what the official 2511 template names; the LoRA is LightX2V's distillation.
+# what the official 2.1 templates name; `convrot` is their int8 default.
 FILES = [
     (
-        "Comfy-Org/Qwen-Image-Edit_ComfyUI",
-        "split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors",
+        "Comfy-Org/Qwen-Image-2.1",
+        "diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
         "diffusion_models",
     ),
     (
-        "Comfy-Org/Qwen-Image_ComfyUI",
-        "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "Comfy-Org/Qwen-Image-2.1",
+        "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
         "text_encoders",
     ),
     (
-        "Comfy-Org/Qwen-Image_ComfyUI",
-        "split_files/vae/qwen_image_vae.safetensors",
+        "Comfy-Org/Qwen-Image-2.1",
+        "vae/qwen_image_2.1_vae_bf16.safetensors",
         "vae",
     ),
-    (
-        "lightx2v/Qwen-Image-Edit-2511-Lightning",
-        "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
-        "loras",
-    ),
+]
+
+# Left behind by the 2511 build of this plugin. Nothing reads them any more,
+# and they are 31GB, so `modal run download.py::prune` clears them out — kept
+# separate from the download because a shared volume may still serve an older
+# deployment of this same app.
+SUPERSEDED = [
+    ("diffusion_models", "qwen_image_edit_2511_fp8mixed.safetensors"),
+    ("text_encoders", "qwen_2.5_vl_7b_fp8_scaled.safetensors"),
+    ("vae", "qwen_image_vae.safetensors"),
+    ("loras", "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"),
 ]
 
 volume = modal.Volume.from_name("models", create_if_missing=True)
 
 model_downloader = modal.App("model_downloader")
 
+_image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "huggingface_hub==1.6.0",
+)
+
 
 @model_downloader.function(
-    image=modal.Image.debian_slim(python_version="3.11").pip_install(
-        "huggingface_hub==1.6.0",
-    ),
+    image=_image,
     volumes={"/models": volume},
-    # ~31GB over four files; the default hour is not enough on a cold volume.
+    # ~17GB over three files; the default hour is not enough on a cold volume.
     timeout=7200,
 )
 def _download() -> None:
@@ -82,6 +90,24 @@ def _download() -> None:
     volume.commit()
 
 
+@model_downloader.function(image=_image, volumes={"/models": volume}, timeout=1800)
+def _prune() -> None:
+    for sub, name in SUPERSEDED:
+        p = os.path.join(COMFY_MODELS, sub, name)
+        if os.path.isfile(p):
+            gb = os.path.getsize(p) / 1e9
+            os.remove(p)
+            print(f"Removed {sub}/{name} ({gb:.1f}GB)")
+        else:
+            print(f"Not present: {sub}/{name}")
+    volume.commit()
+
+
 @model_downloader.local_entrypoint()
 def download() -> None:
     _download.remote()
+
+
+@model_downloader.local_entrypoint()
+def prune() -> None:
+    _prune.remote()
