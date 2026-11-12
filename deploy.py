@@ -156,7 +156,7 @@ image = (
         f"https://github.com/comfyanonymous/ComfyUI.git {COMFY}",
         f"pip install -r {COMFY}/requirements.txt",
     )
-    .pip_install("tongflow==0.3.3", "fastapi[standard]")
+    .pip_install("tongflow==1.0.0", "fastapi[standard]")
     .env({
         "PYTHONPATH": COMFY,
         "HF_HOME": "/models/hf",
